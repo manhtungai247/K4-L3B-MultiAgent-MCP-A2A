@@ -61,6 +61,44 @@ def _timeline_events(value: Any) -> list[dict[str, Any]]:
     return _records(value)
 
 
+def _unique_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return list({json.dumps(row, sort_keys=True): row for row in records}.values())
+
+
+def _item_total(records: list[dict[str, Any]]) -> tuple[Decimal | None, bool]:
+    totals: dict[str, Decimal] = {}
+    for index, row in enumerate(_unique_rows(records)):
+        price = _money(_value(row, ("price", "item_price_brl")))
+        if price is None:
+            continue
+        freight = _money(_value(row, ("freight_value", "freight_brl")))
+        identity = str(_value(row, ("order_item_id", "item_id")) or f"row-{index}")
+        amount = price + (freight or Decimal("0"))
+        if identity in totals and totals[identity] != amount:
+            return None, True
+        totals[identity] = amount
+    return (sum(totals.values(), Decimal("0")) if totals else None), False
+
+
+def _duplicate_capture(records: list[dict[str, Any]], expected: Decimal | None) -> bool:
+    if expected is None or expected <= 0:
+        return False
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in _unique_rows(records):
+        timestamp = _time(_value(row, ("event_at", "occurred_at", "captured_at")))
+        identity = _value(row, ("capture_id", "transaction_id", "payment_id"))
+        if timestamp is None and identity is None:
+            continue
+        group = timestamp.date().isoformat() if timestamp else "identified"
+        groups.setdefault(group, []).append(row)
+    for rows in groups.values():
+        identities = _ids(rows, ("capture_id", "transaction_id", "payment_id", "event_at"))
+        amount = _amount(rows, ("captured_amount_brl", "amount_captured", "amount_brl", "amount"))
+        if len(identities) > 1 and amount is not None and amount > expected + Decimal("0.01"):
+            return True
+    return False
+
+
 def _all_values(record: Any, names: tuple[str, ...]) -> list[Any]:
     values: list[Any] = []
     if isinstance(record, dict):
@@ -460,33 +498,46 @@ async def solve_case(
             "capture_event_ledger_precedence",
         )
     captured = timeline_captured if timeline_captured is not None else reported_captured
+    completed_refunds = [
+        row
+        for row in refund_events
+        if str(_value(row, ("status", "refund_status", "event_type")) or "").casefold()
+        in {"completed", "success", "succeeded", "refunded", "refund_completed"}
+    ]
     refunded = _amount(
-        refund_events,
-        ("refunded_total_brl", "refund_amount_brl", "refund_value", "amount_refunded"),
+        completed_refunds,
+        (
+            "refunded_total_brl",
+            "refund_amount_brl",
+            "refund_value",
+            "amount_refunded",
+            "amount_brl",
+            "amount",
+        ),
     )
     if refunded is None and refund_timeline is not None:
         refunded = Decimal("0")
-    item_total = Decimal("0")
-    has_item_total = False
-    for record in item_records:
-        price = _money(_value(record, ("price", "item_price_brl")))
-        freight = _money(_value(record, ("freight_value", "freight_brl")))
-        if price is not None:
-            item_total += price + (freight or Decimal("0"))
-            has_item_total = True
-    expected_total = item_total if has_item_total else None
+    expected_total, item_conflict = _item_total(item_records)
+    if item_conflict:
+        record_conflict(
+            "item_total_brl",
+            ["get_order_items", "get_order_payments"],
+            None,
+            "conflicting_item_versions",
+        )
+    history_versions = _unique_rows(
+        [row for row in history_records if row.get("order_id") == resolved_id]
+    )
+    if len(history_versions) > 1:
+        record_conflict(
+            "order_history", ["get_order", "get_customer_history"], None, "multiple_order_versions"
+        )
 
     refund_states = {
         str(_value(record, ("status", "event_type", "refund_status")) or "").casefold()
         for record in refund_events
     }
-    capture_ids = _ids(capture_records, ("capture_id", "transaction_id", "payment_id"))
-    duplicate_capture = (
-        len(capture_ids) > 1
-        and captured is not None
-        and expected_total is not None
-        and captured > expected_total + Decimal("0.01")
-    )
+    duplicate_capture = _duplicate_capture(capture_records, expected_total)
     refund_pending = any("pending" in value or "process" in value for value in refund_states)
     refund_failed = any("fail" in value or "reject" in value for value in refund_states)
     refund_complete = any(
@@ -569,6 +620,31 @@ async def solve_case(
     else:
         shipment_verdict = "insufficient_evidence"
 
+    late_events = [
+        event
+        for event in _timeline_events(shipment_data)
+        if event.get("event_type") == "delivered_late" and event.get("status") == "confirmed"
+    ]
+    supported_delays = {
+        "late_delivery_seller" if event.get("actor") == "seller" else "late_delivery_logistics"
+        for event in late_events
+        if event.get("actor") in {"seller", "logistics_provider"}
+    }
+    if supported_delays and shipment_verdict == "on_time":
+        record_conflict(
+            "delivery_status",
+            ["get_order", "get_shipment_summary"],
+            None,
+            "delivery_event_conflicts_with_snapshot",
+        )
+        shipment_verdict = "conflicting"
+
+    reconciliation_event = any(
+        event.get("event_type") == "reconciliation_mismatch"
+        and event.get("status") not in {"resolved", "void", "canceled"}
+        for event in payment_events
+    )
+
     if refund_failed:
         payment_verdict = "refund_failed"
     elif refund_pending:
@@ -577,13 +653,13 @@ async def solve_case(
         payment_verdict = "refunded"
     elif duplicate_capture:
         payment_verdict = "duplicate_capture"
-    elif (
+    elif reconciliation_event or (
         captured is not None
         and expected_total is not None
         and abs(captured - expected_total) > Decimal("0.01")
     ):
         payment_verdict = "capture_mismatch"
-    elif captured is not None:
+    elif captured is not None and expected_total is not None:
         payment_verdict = "reconciled"
     else:
         payment_verdict = "insufficient_evidence"
@@ -591,27 +667,30 @@ async def solve_case(
     confirmed: list[str] = []
     if (
         ("canceled" in order_status or "cancelled" in order_status)
-        and refund_timeline is not None
+        and refunded is not None
         and captured is not None
         and captured > (refunded or Decimal("0"))
     ):
         confirmed.append("canceled_order_paid")
     if (
         "unavailable" in order_status
-        and refund_timeline is not None
+        and refunded is not None
         and captured is not None
         and captured > (refunded or Decimal("0"))
     ):
         confirmed.append("unavailable_order_paid")
     if shipment_verdict in {"seller_delay", "logistics_delay"}:
         confirmed.append("late_delivery_" + shipment_verdict.removesuffix("_delay"))
+    confirmed.extend(sorted(supported_delays - set(confirmed)))
+    if reconciliation_event:
+        confirmed.append("payment_mismatch")
     if payment_verdict == "refund_pending":
         confirmed.append("refund_pending")
     if payment_verdict == "refund_failed":
         confirmed.append("refund_failed")
     if payment_verdict == "duplicate_capture":
         confirmed.append("duplicate_charge")
-    if payment_verdict == "capture_mismatch":
+    if payment_verdict == "capture_mismatch" and "payment_mismatch" not in confirmed:
         confirmed.append("payment_mismatch")
     if payment_verdict == "reconciled" and len(payment_records) > 1 and expected_total is not None:
         confirmed.append("valid_split_payment")
@@ -626,6 +705,8 @@ async def solve_case(
     ):
         confirmed.append("unsupported_claim")
     primary = next((topic for topic in candidate_topics if topic in confirmed), None)
+    if primary is None and confirmed:
+        primary = confirmed[0]
     if primary is None and resolution_status != "resolved":
         primary = "insufficient_evidence"
     elif primary is None and payment_verdict == "capture_mismatch":
@@ -737,8 +818,12 @@ async def solve_case(
         if resolution_status == "resolved" and not transport_broken and policy_evidence
         else 0.35
     )
-    if len(rejected) or shipment_verdict == "conflicting":
+    if data_conflicts or len(rejected) or shipment_verdict == "conflicting":
         confidence = min(confidence, 0.62)
+    if primary == "insufficient_evidence":
+        confidence = min(confidence, 0.35)
+    elif refund_timeline is None or errors:
+        confidence = min(confidence, 0.70)
 
     trace.emit(
         case_id=case_id,

@@ -314,3 +314,86 @@ def test_timeline_prefers_event_ledger_over_payment_summary() -> None:
     assert _timeline_events(payload) == [capture]
     assert _timeline_events({"payments": [{"payment_value": "16.00"}], "events": []}) == []
     assert _timeline_events([capture]) == [capture]
+
+
+def test_item_total_deduplicates_identity_and_rejects_conflicting_versions() -> None:
+    from decimal import Decimal
+
+    from student_agent.workflow import _item_total
+
+    row = {"order_item_id": "1", "price": "100", "freight_value": "16"}
+    assert _item_total([row, dict(row)]) == (Decimal("116"), False)
+    assert _item_total([row, {**row, "freight_value": "18"}]) == (None, True)
+    assert _item_total([row, {**row, "order_item_id": "2"}]) == (Decimal("232"), False)
+
+
+def test_event_conflict_and_failed_refund_are_not_silently_discarded(tmp_path: Path) -> None:
+    class EventGateway(FakeGateway):
+        async def call(self, tool: str, *, case_id: str, **args: str) -> dict[str, Any]:
+            result = await super().call(tool, case_id=case_id, **args)
+            if tool == "get_shipment_summary":
+                result["data"] = {
+                    "delivered_customer_at": "2018-01-04T10:00:00-03:00",
+                    "events": [
+                        {
+                            "event_type": "delivered_late",
+                            "status": "confirmed",
+                            "actor": "logistics_provider",
+                        }
+                    ],
+                }
+            if tool == "get_refund_timeline":
+                result["data"] = {
+                    "events": [
+                        {"event_type": "refund_requested", "status": "failed", "amount_brl": "99"},
+                        {
+                            "event_type": "refund_completed",
+                            "status": "completed",
+                            "amount_brl": "5",
+                        },
+                    ]
+                }
+            return result
+
+    root = Path(__file__).resolve().parents[1]
+    contracts = Contracts(root / "contracts" / "schemas")
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_001",
+                "policy_version": "EC_POLICY_V2",
+                "candidate_order_ids": ["order-1"],
+                "customer_unique_id_hint": "customer-1",
+                "customer_request": {
+                    "claimed_order_id": "order-1",
+                    "claims": [{"claim_id": "a", "topic": "late_delivery_logistics"}],
+                },
+                "investigation_scope": {"include_customer_history": True},
+            },
+            EventGateway(),
+            TraceWriter(tmp_path / "trace.jsonl", contracts),
+        )
+    )
+    contracts.validate_output(output, "event conflict")
+    assert output["assessment"]["primary_issue"] == "late_delivery_logistics"
+    assert output["shipment_analysis"]["verdict"] == "conflicting"
+    assert output["payment_analysis"]["refunded_total_brl"] == 5.0
+    assert output["assessment"]["confidence"] < 0.82
+    assert any(x["field"] == "delivery_status" for x in output["data_conflicts"])
+
+
+def test_duplicate_capture_requires_distinct_events_in_same_period() -> None:
+    from decimal import Decimal
+
+    from student_agent.workflow import _duplicate_capture
+
+    first = {"event_at": "2018-01-01T10:00:00Z", "amount_brl": "89"}
+    later = {"event_at": "2018-02-01T10:00:00Z", "amount_brl": "89"}
+    assert not _duplicate_capture([first, later], Decimal("89"))
+    assert not _duplicate_capture([first, dict(first)], Decimal("89"))
+    assert _duplicate_capture([first, {**later, "event_at": "2018-01-01T11:00:00Z"}], Decimal("89"))
+    split = [
+        {**first, "amount_brl": "44.50"},
+        {**first, "event_at": "2018-01-01T11:00:00Z", "amount_brl": "44.50"},
+    ]
+    assert not _duplicate_capture(split, Decimal("89"))
