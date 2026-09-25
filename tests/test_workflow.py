@@ -223,3 +223,42 @@ def test_shipment_timeline_is_selected_and_conflict_is_reported(tmp_path: Path) 
             "resolution_code": "shipment_timeline_precedence",
         }
     ]
+
+
+def test_missing_refund_evidence_does_not_assume_zero_prior_refunds(
+    tmp_path: Path,
+) -> None:
+    class MissingRefundGateway(FakeGateway):
+        async def call(self, tool: str, *, case_id: str, **args: str) -> dict[str, Any]:
+            if tool == "get_refund_timeline":
+                raise MCPToolError("refund timeline unavailable")
+            return await super().call(tool, case_id=case_id, **args)
+
+    root = Path(__file__).resolve().parents[1]
+    contracts = Contracts(root / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_001",
+                "policy_version": "EC_POLICY_V2",
+                "candidate_order_ids": ["order-1", "candidate-no-match"],
+                "customer_unique_id_hint": "customer-1",
+                "customer_request": {
+                    "claimed_order_id": "order-1",
+                    "claims": [
+                        {"claim_id": "claim-a", "topic": "late_delivery_logistics"},
+                        {"claim_id": "claim-b", "topic": "requested_full_refund"},
+                    ],
+                },
+                "investigation_scope": {"include_customer_history": True},
+            },
+            MissingRefundGateway(),
+            trace,
+        )
+    )
+
+    contracts.validate_output(output, "missing refund evidence output")
+    assert output["payment_analysis"]["refunded_total_brl"] is None
+    assert output["financial_resolution"]["recommended_refund_brl"] == 0.0
+    assert output["claim_assessments"][1]["verdict"] == "insufficient_evidence"

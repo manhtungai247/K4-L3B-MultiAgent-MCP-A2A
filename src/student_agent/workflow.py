@@ -148,6 +148,14 @@ async def solve_case(
             result = await gateway.call(tool, case_id=case_id, **arguments)
         except MCPToolError:
             errors.append(tool + ":tool_error")
+            trace.emit(
+                case_id=case_id,
+                event_type="handoff",
+                actor=actor,
+                target="coordinator",
+                decision_code="tool_unavailable",
+                attributes={"tool": tool, "error_type": "MCPToolError"},
+            )
             return None
         except Exception as exc:
             errors.append(tool + ":transport_error")
@@ -383,6 +391,8 @@ async def solve_case(
         refund_events,
         ("refunded_total_brl", "refund_amount_brl", "refund_value", "amount_refunded"),
     )
+    if refunded is None and refund_timeline is not None:
+        refunded = Decimal("0")
     item_total = Decimal("0")
     has_item_total = False
     for record in item_records:
@@ -500,12 +510,14 @@ async def solve_case(
     confirmed: list[str] = []
     if (
         ("canceled" in order_status or "cancelled" in order_status)
+        and refund_timeline is not None
         and captured is not None
         and captured > (refunded or Decimal("0"))
     ):
         confirmed.append("canceled_order_paid")
     if (
         "unavailable" in order_status
+        and refund_timeline is not None
         and captured is not None
         and captured > (refunded or Decimal("0"))
     ):
@@ -566,6 +578,8 @@ async def solve_case(
 
     raw_refund = _money(rule.get("refund_brl"))
     recommended = raw_refund if raw_refund is not None else Decimal("0")
+    if refund_timeline is None:
+        recommended = Decimal("0")
     if captured is not None and refunded is not None:
         recommended = min(recommended, max(Decimal("0"), captured - refunded))
     responsible = rule.get("responsible_parties", []) if isinstance(rule, dict) else []
@@ -587,7 +601,9 @@ async def solve_case(
         topic = str(claim.get("topic", ""))
         if topic == "requested_full_refund":
             verdict = (
-                "supported"
+                "insufficient_evidence"
+                if refund_timeline is None or captured is None
+                else "supported"
                 if captured is not None and recommended >= captured - (refunded or Decimal("0"))
                 else (
                     "partially_supported"
@@ -612,7 +628,7 @@ async def solve_case(
             )
             or (
                 topic in {"canceled_order_paid", "unavailable_order_paid"}
-                and (not order_status or captured is None)
+                and (not order_status or captured is None or refund_timeline is None)
             )
         ):
             verdict = "insufficient_evidence"

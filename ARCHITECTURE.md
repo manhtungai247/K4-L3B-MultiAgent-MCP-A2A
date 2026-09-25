@@ -76,6 +76,7 @@ chosen source and resolution code appear in `data_conflicts`.
 | --- | ---: | --- | --- |
 | Candidate order lookup returns a tool error | 0 | Continue with other candidates; do not fabricate evidence | Record other successful results; unresolved entity stays unresolved |
 | MCP transport failure | 0 | Stop fetching for that case; resume skips only cases with valid output and final trace | Emit `evidence_unavailable`; runner stops rather than submit partial results |
+| Refund timeline tool error | 0 | Leave refunded total unknown, propose no refund, and mark the full-refund claim insufficient | Emit `tool_unavailable`; do not treat an error as an empty refund ledger |
 | Candidate identity is missing or conflicting | 0 | Use exact claimed ID only when the source has no explicit mismatch | `not_found` / `ambiguous`; package checks required evidence |
 | Shipment or payment sources disagree | 0 | Use the timeline source described above | Add a `data_conflicts` entry |
 | Required evidence domain is absent | 0 | No synthetic or cached cross-case substitute | Local artifact validation rejects packaging |
@@ -93,9 +94,10 @@ within one case; all calls remain auditable by the competition service.
 
 Before packaging, the validator requires one schema-valid output per input case,
 valid trace events, the required lifecycle events in order, unique event IDs,
-same-case evidence references consumed in trace, and the scoped order, item,
-payment, shipment, refund, policy, customer, and product evidence domains. It
-also rejects Team API Key patterns in output or trace. The output-only packager
+same-case evidence references consumed in trace, and the required domains for
+the resolved entity and investigation scope. A refund domain is required when a
+refund result or status is asserted. It also rejects Team API Key patterns in
+output or trace. The output-only packager
 adds only `output/<case_id>.json` files to the ZIP; source, inputs, `.env`,
 metadata, traces, and audit material stay outside that upload archive.
 

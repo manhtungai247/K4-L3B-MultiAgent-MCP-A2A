@@ -112,11 +112,26 @@ def validate_artifacts(
             if event["event_type"] == "tool_result_consumed"
         }
         scope = case_set.cases[case_id].get("investigation_scope", {})
-        required_domains = {"order", "item", "payment", "shipment", "policy", "refund"}
+        required_domains = {"policy"}
+        entity_resolution = output.get("entity_resolution", {})
+        resolved = entity_resolution.get("status") == "resolved"
+        if resolved:
+            required_domains.update({"order", "item", "payment", "shipment"})
         if scope.get("include_customer_history"):
             required_domains.add("customer")
-        if scope.get("include_product_context"):
+        if resolved and scope.get("include_product_context"):
             required_domains.add("product")
+        payment_analysis = output.get("payment_analysis", {})
+        if (
+            payment_analysis.get("verdict")
+            in {
+                "refund_pending",
+                "refund_failed",
+                "refunded",
+            }
+            or payment_analysis.get("refunded_total_brl") is not None
+        ):
+            required_domains.add("refund")
         if not required_domains <= consumed_domains:
             missing_domains = sorted(required_domains - consumed_domains)
             raise ValueError(

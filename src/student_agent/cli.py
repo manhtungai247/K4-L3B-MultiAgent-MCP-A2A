@@ -45,6 +45,10 @@ def _prepare_resume(root: Path, case_set: CaseSet, contracts: Contracts) -> set[
             events_by_case[event["case_id"]].append((event, line))
 
     completed: set[str] = set()
+    scoring = json.loads(
+        (root / "contracts" / "scoring" / "scoring-policy-v2.json").read_text(encoding="utf-8")
+    )
+    required_lifecycle = scoring["workflow_required_events"]
     for case_id in case_set.case_ids:
         output_path = root / "outputs" / f"{case_id}.json"
         events = events_by_case[case_id]
@@ -60,7 +64,45 @@ def _prepare_resume(root: Path, case_set: CaseSet, contracts: Contracts) -> set[
             contracts.validate_output(output, f"outputs/{case_id}.json")
         except ValueError:
             continue
-        if output.get("case_id") == case_id:
+        if output.get("case_id") != case_id:
+            continue
+        event_types = [event["event_type"] for event, _ in events]
+        if not set(required_lifecycle) <= set(event_types):
+            continue
+        positions = [event_types.index(event_type) for event_type in required_lifecycle]
+        if positions != sorted(positions):
+            continue
+        consumed_refs = {
+            evidence_ref
+            for event, _ in events
+            if event["event_type"] == "tool_result_consumed"
+            for evidence_ref in event.get("evidence_refs", [])
+        }
+        output_refs = set(output.get("evidence_refs", []))
+        if not output_refs or not output_refs <= consumed_refs:
+            continue
+        scope = case_set.cases[case_id].get("investigation_scope", {})
+        resolution = output.get("entity_resolution", {})
+        required_domains = {"policy"}
+        resolved = resolution.get("status") == "resolved"
+        if resolved:
+            required_domains.update({"order", "item", "payment", "shipment"})
+        if scope.get("include_customer_history"):
+            required_domains.add("customer")
+        if resolved and scope.get("include_product_context"):
+            required_domains.add("product")
+        payment = output.get("payment_analysis", {})
+        if (
+            payment.get("verdict") in {"refund_pending", "refund_failed", "refunded"}
+            or payment.get("refunded_total_brl") is not None
+        ):
+            required_domains.add("refund")
+        consumed_domains = {
+            (event.get("attributes") or {}).get("domain")
+            for event, _ in events
+            if event["event_type"] == "tool_result_consumed"
+        }
+        if required_domains <= consumed_domains:
             completed.add(case_id)
 
     for path in (root / "outputs").glob("*.json"):
@@ -97,6 +139,11 @@ async def _run(root: Path, *, resume: bool = False) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     completed_cases = _prepare_resume(root, case_set, contracts) if resume else set()
+    if resume:
+        print(
+            f"Resume: keeping {len(completed_cases)} validated cases; "
+            f"rerunning {len(case_set.case_ids) - len(completed_cases)} unfinished cases"
+        )
     if not resume:
         for stale in output_root.glob("*.json"):
             stale.unlink()
