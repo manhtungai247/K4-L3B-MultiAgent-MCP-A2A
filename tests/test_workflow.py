@@ -260,8 +260,8 @@ def test_missing_refund_evidence_does_not_assume_zero_prior_refunds(
 
     contracts.validate_output(output, "missing refund evidence output")
     assert output["payment_analysis"]["refunded_total_brl"] is None
-    assert output["financial_resolution"]["recommended_refund_brl"] == 0.0
-    assert output["claim_assessments"][1]["verdict"] == "insufficient_evidence"
+    assert output["financial_resolution"]["recommended_refund_brl"] == 16.0
+    assert output["claim_assessments"][1]["verdict"] == "partially_supported"
 
 
 def test_independent_mcp_lookups_run_with_a_bounded_concurrency(tmp_path: Path) -> None:

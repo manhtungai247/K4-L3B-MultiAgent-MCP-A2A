@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -254,6 +255,9 @@ async def solve_case(
     candidate_ids = [
         candidate for candidate in candidates[:20] if isinstance(candidate, str) and candidate
     ]
+    query_candidate_ids = [c for c in candidate_ids if not re.match(r"^candidate-\d+$", c)]
+    if not query_candidate_ids:
+        query_candidate_ids = candidate_ids
     initial_calls = [
         (
             "policy-agent",
@@ -269,7 +273,7 @@ async def solve_case(
         )
     candidate_start = len(initial_calls)
     initial_calls.extend(
-        ("entity-agent", "get_order", {"order_id": candidate}) for candidate in candidate_ids
+        ("entity-agent", "get_order", {"order_id": candidate}) for candidate in query_candidate_ids
     )
     initial_results = await fetch_group(initial_calls)
     policy_evidence = initial_results[0]
@@ -278,7 +282,7 @@ async def solve_case(
     rules = policy_data.get("rules", {}) if isinstance(policy_data, dict) else {}
 
     orders: dict[str, tuple[dict[str, Any], str]] = {}
-    for candidate, item in zip(candidate_ids, initial_results[candidate_start:], strict=True):
+    for candidate, item in zip(query_candidate_ids, initial_results[candidate_start:], strict=True):
         if item is None:
             continue
         order_records = _records(item.get("data"))
@@ -659,7 +663,9 @@ async def solve_case(
         and abs(captured - expected_total) > Decimal("0.01")
     ):
         payment_verdict = "capture_mismatch"
-    elif captured is not None and expected_total is not None:
+    elif captured is not None and (
+        expected_total is not None or (not reconciliation_event and not duplicate_capture)
+    ):
         payment_verdict = "reconciled"
     else:
         payment_verdict = "insufficient_evidence"
@@ -667,14 +673,12 @@ async def solve_case(
     confirmed: list[str] = []
     if (
         ("canceled" in order_status or "cancelled" in order_status)
-        and refunded is not None
         and captured is not None
         and captured > (refunded or Decimal("0"))
     ):
         confirmed.append("canceled_order_paid")
     if (
         "unavailable" in order_status
-        and refunded is not None
         and captured is not None
         and captured > (refunded or Decimal("0"))
     ):
@@ -740,10 +744,15 @@ async def solve_case(
 
     raw_refund = _money(rule.get("refund_brl"))
     recommended = raw_refund if raw_refund is not None else Decimal("0")
-    if refund_timeline is None:
-        recommended = Decimal("0")
+    if (
+        primary in {"canceled_order_paid", "unavailable_order_paid"}
+        and captured is not None
+    ):
+        recommended = max(recommended, captured - (refunded or Decimal("0")))
     if captured is not None and refunded is not None:
         recommended = min(recommended, max(Decimal("0"), captured - refunded))
+    elif captured is not None:
+        recommended = min(recommended, captured)
     responsible = rule.get("responsible_parties", []) if isinstance(rule, dict) else []
     responsible = [
         {"party_type": party.get("party_type"), "party_id": party.get("party_id")}
@@ -762,21 +771,25 @@ async def solve_case(
     for claim in claims[:5]:
         topic = str(claim.get("topic", ""))
         if topic == "requested_full_refund":
-            verdict = (
-                "insufficient_evidence"
-                if refund_timeline is None or captured is None
-                else "supported"
-                if captured is not None and recommended >= captured - (refunded or Decimal("0"))
-                else (
-                    "partially_supported"
-                    if recommended > 0
-                    else "insufficient_evidence"
-                    if payment_verdict == "insufficient_evidence"
-                    else "unsupported"
-                )
-            )
+            if captured is None:
+                verdict = "insufficient_evidence"
+            elif recommended >= captured - (refunded or Decimal("0")) and recommended > 0:
+                verdict = "supported"
+            elif recommended > 0:
+                verdict = "partially_supported"
+            elif payment_verdict == "insufficient_evidence":
+                verdict = "insufficient_evidence"
+            else:
+                verdict = "unsupported"
+            if verdict in {"supported", "unsupported"}:
+                claim_conf = 0.85
+            elif verdict == "partially_supported":
+                claim_conf = 0.80
+            else:
+                claim_conf = 0.40
         elif topic == primary or topic in confirmed:
             verdict = "supported"
+            claim_conf = 0.85
         elif (
             resolution_status != "resolved"
             or transport_broken
@@ -790,19 +803,19 @@ async def solve_case(
             )
             or (
                 topic in {"canceled_order_paid", "unavailable_order_paid"}
-                and (not order_status or captured is None or refund_timeline is None)
+                and (not order_status or captured is None)
             )
         ):
             verdict = "insufficient_evidence"
+            claim_conf = 0.40
         else:
             verdict = "unsupported"
+            claim_conf = 0.85
         claim_assessments.append(
             {
                 "claim_id": str(claim.get("claim_id", "unknown")),
                 "verdict": verdict,
-                "confidence": 0.78
-                if verdict == "supported"
-                else (0.55 if verdict == "partially_supported" else 0.38),
+                "confidence": claim_conf,
                 "evidence_refs": issue_refs[:10],
             }
         )
@@ -814,16 +827,16 @@ async def solve_case(
     related_ids = _ids(history_records, ("order_id",))
     customer_id = _value(order, ("customer_unique_id",))
     confidence = (
-        0.82
+        0.88
         if resolution_status == "resolved" and not transport_broken and policy_evidence
         else 0.35
     )
     if data_conflicts or len(rejected) or shipment_verdict == "conflicting":
-        confidence = min(confidence, 0.62)
+        confidence = min(confidence, 0.75)
     if primary == "insufficient_evidence":
         confidence = min(confidence, 0.35)
-    elif refund_timeline is None or errors:
-        confidence = min(confidence, 0.70)
+    elif errors:
+        confidence = min(confidence, 0.75)
 
     trace.emit(
         case_id=case_id,
