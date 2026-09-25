@@ -262,3 +262,45 @@ def test_missing_refund_evidence_does_not_assume_zero_prior_refunds(
     assert output["payment_analysis"]["refunded_total_brl"] is None
     assert output["financial_resolution"]["recommended_refund_brl"] == 0.0
     assert output["claim_assessments"][1]["verdict"] == "insufficient_evidence"
+
+
+def test_independent_mcp_lookups_run_with_a_bounded_concurrency(tmp_path: Path) -> None:
+    class ConcurrentGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.peak = 0
+
+        async def call(self, tool: str, *, case_id: str, **args: str) -> dict[str, Any]:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                await asyncio.sleep(0.01)
+                return await super().call(tool, case_id=case_id, **args)
+            finally:
+                self.active -= 1
+
+    root = Path(__file__).resolve().parents[1]
+    contracts = Contracts(root / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+    gateway = ConcurrentGateway()
+    output = asyncio.run(
+        solve_case(
+            {
+                "case_id": "CASE_001",
+                "policy_version": "EC_POLICY_V2",
+                "candidate_order_ids": ["order-1", "candidate-no-match"],
+                "customer_unique_id_hint": "customer-1",
+                "customer_request": {"claimed_order_id": "order-1", "claims": []},
+                "investigation_scope": {
+                    "include_customer_history": True,
+                    "include_product_context": True,
+                },
+            },
+            gateway,
+            trace,
+        )
+    )
+
+    contracts.validate_output(output, "concurrent lookup output")
+    assert gateway.peak == 4

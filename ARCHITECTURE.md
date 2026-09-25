@@ -75,7 +75,7 @@ chosen source and resolution code appear in `data_conflicts`.
 | Failure | Retry budget | Fallback | Trace / package behavior |
 | --- | ---: | --- | --- |
 | Candidate order lookup returns a tool error | 0 | Continue with other candidates; do not fabricate evidence | Record other successful results; unresolved entity stays unresolved |
-| MCP transport failure | 0 | Stop fetching for that case; resume skips only cases with valid output and final trace | Emit `evidence_unavailable`; runner stops rather than submit partial results |
+| MCP transport failure | Up to 5 connection retries in HTTP transport | Stop fetching for that case; resume skips only cases with valid output and final trace | Emit `evidence_unavailable`; runner stops rather than submit partial results |
 | Refund timeline tool error | 0 | Leave refunded total unknown, propose no refund, and mark the full-refund claim insufficient | Emit `tool_unavailable`; do not treat an error as an empty refund ledger |
 | Candidate identity is missing or conflicting | 0 | Use exact claimed ID only when the source has no explicit mismatch | `not_found` / `ambiguous`; package checks required evidence |
 | Shipment or payment sources disagree | 0 | Use the timeline source described above | Add a `data_conflicts` entry |
@@ -87,7 +87,9 @@ only cases whose output and lifecycle/evidence trace validate, drops unfinished
 case artifacts, and continues with the rest. Each L3B case uses at most ten calls: policy,
 customer history, two candidate
 orders, and six scoped order/product/shipment/payment/refund lookups. There are
-no automatic retries. The gateway cache prevents duplicate identical calls
+There are no workflow-level retries; the HTTP transport retries connection
+failures up to five times. Independent calls run in groups capped at four
+concurrent requests. The gateway cache prevents duplicate identical calls
 within one case; all calls remain auditable by the competition service.
 
 ## 6. Verification invariants

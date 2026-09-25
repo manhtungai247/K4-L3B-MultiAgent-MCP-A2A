@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -183,6 +184,21 @@ async def solve_case(
         )
         return result
 
+    async def fetch_group(
+        calls: list[tuple[str, str, dict[str, str]]],
+    ) -> list[dict[str, Any] | None]:
+        semaphore = asyncio.Semaphore(4)
+
+        async def bounded_fetch(
+            actor: str, tool: str, arguments: dict[str, str]
+        ) -> dict[str, Any] | None:
+            async with semaphore:
+                return await fetch(actor, tool, **arguments)
+
+        return await asyncio.gather(
+            *(bounded_fetch(actor, tool, arguments) for actor, tool, arguments in calls)
+        )
+
     trace.emit(
         case_id=case_id,
         event_type="task_assigned",
@@ -190,17 +206,34 @@ async def solve_case(
         target="entity-agent",
         decision_code="resolve_candidates",
     )
-    policy_evidence = await fetch(
-        "policy-agent", "get_policy", policy_version=str(case.get("policy_version", ""))
+    candidate_ids = [
+        candidate for candidate in candidates[:20] if isinstance(candidate, str) and candidate
+    ]
+    initial_calls = [
+        (
+            "policy-agent",
+            "get_policy",
+            {"policy_version": str(case.get("policy_version", ""))},
+        )
+    ]
+    history_index: int | None = None
+    if case.get("investigation_scope", {}).get("include_customer_history") and hint:
+        history_index = len(initial_calls)
+        initial_calls.append(
+            ("entity-agent", "get_customer_history", {"customer_unique_id": str(hint)})
+        )
+    candidate_start = len(initial_calls)
+    initial_calls.extend(
+        ("entity-agent", "get_order", {"order_id": candidate}) for candidate in candidate_ids
     )
+    initial_results = await fetch_group(initial_calls)
+    policy_evidence = initial_results[0]
+    history_evidence = initial_results[history_index] if history_index is not None else None
     policy_data = policy_evidence.get("data", {}) if policy_evidence else {}
     rules = policy_data.get("rules", {}) if isinstance(policy_data, dict) else {}
 
     orders: dict[str, tuple[dict[str, Any], str]] = {}
-    for candidate in candidates[:20]:
-        if not isinstance(candidate, str) or not candidate:
-            continue
-        item = await fetch("entity-agent", "get_order", order_id=candidate)
+    for candidate, item in zip(candidate_ids, initial_results[candidate_start:], strict=True):
         if item is None:
             continue
         order_records = _records(item.get("data"))
@@ -211,11 +244,6 @@ async def solve_case(
         if record is not None:
             orders[candidate] = (record, _ref(item))
 
-    history_evidence = None
-    if case.get("investigation_scope", {}).get("include_customer_history") and hint:
-        history_evidence = await fetch(
-            "entity-agent", "get_customer_history", customer_unique_id=str(hint)
-        )
     history_records = _records(history_evidence.get("data")) if history_evidence else []
     history_order_ids = set(_ids(history_records, ("order_id",)))
 
@@ -295,17 +323,55 @@ async def solve_case(
             target="order-product-agent",
             decision_code="investigate_resolved_order",
         )
-        item_evidence = await fetch("order-product-agent", "get_order_items", order_id=resolved_id)
+        specialist_calls = [
+            (
+                "order-product-agent",
+                "get_order_items",
+                {"order_id": resolved_id},
+            )
+        ]
+        specialist_keys = ["item"]
         if case.get("investigation_scope", {}).get("include_product_context"):
-            await fetch("order-product-agent", "get_product_context", order_id=resolved_id)
-        shipment_evidence = await fetch(
-            "shipment-agent", "get_shipment_summary", order_id=resolved_id
+            specialist_calls.append(
+                (
+                    "order-product-agent",
+                    "get_product_context",
+                    {"order_id": resolved_id},
+                )
+            )
+            specialist_keys.append("product")
+        specialist_calls.extend(
+            [
+                (
+                    "shipment-agent",
+                    "get_shipment_summary",
+                    {"order_id": resolved_id},
+                ),
+                (
+                    "payment-agent",
+                    "get_order_payments",
+                    {"order_id": resolved_id},
+                ),
+                (
+                    "payment-agent",
+                    "get_payment_timeline",
+                    {"order_id": resolved_id},
+                ),
+                (
+                    "payment-agent",
+                    "get_refund_timeline",
+                    {"order_id": resolved_id},
+                ),
+            ]
         )
-        payment_evidence = await fetch("payment-agent", "get_order_payments", order_id=resolved_id)
-        payment_timeline = await fetch(
-            "payment-agent", "get_payment_timeline", order_id=resolved_id
-        )
-        refund_timeline = await fetch("payment-agent", "get_refund_timeline", order_id=resolved_id)
+        specialist_keys.extend(["shipment", "payments", "payment_timeline", "refund_timeline"])
+        specialist_results = await fetch_group(specialist_calls)
+        specialist_evidence = dict(zip(specialist_keys, specialist_results, strict=True))
+        item_evidence = specialist_evidence.get("item")
+        shipment_evidence = specialist_evidence.get("shipment")
+        payment_evidence = specialist_evidence.get("payments")
+        payment_timeline = specialist_evidence.get("payment_timeline")
+        refund_timeline = specialist_evidence.get("refund_timeline")
 
     trace.emit(
         case_id=case_id,
