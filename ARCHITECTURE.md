@@ -110,8 +110,10 @@ arithmetic for currency comparisons, and no random model sampling. Event IDs and
 timestamps are generated at runtime. `metadata.json` declares model name
 `none - deterministic Python rule engine`, zero model parameters, and no
 external LLM. Run with `day09 validate-inputs`, `day09 mcp-tools`, `day09 run`,
-`day09 validate`, and `day09 package --output dist/submission.zip --output-only`.
-
-The screenshot upload flow confirmed by Lab Coach is the legacy output-only
-package. L3B inputs, schemas, tools, and adjudication contracts stay on the L3B
-variant supplied in this checkout.
+`day09 validate`, and `day09 package --output dist/submission.zip`. The V2
+packager writes `manifest.json`, `trace.jsonl`, and
+`outputs/<case_id>.json`, after validating all artifacts against the L3B
+contracts. Do not use `--output-only` for the current portal: its latest upload
+validation reports that the V2 manifest is missing from that legacy package.
+L3B inputs, schemas, tools, and adjudication contracts stay on the L3B variant
+supplied in this checkout.

@@ -165,23 +165,27 @@ Nếu output pass schema nhưng điểm thấp, cần kiểm tra semantic, entit
 
 ## 7. Đóng gói và nộp bài
 
-Với luồng upload `output/` mà Lab Coach xác nhận cho bài này, chạy:
+Portal hiện báo `ZIP V2 thiếu manifest.json` khi nhận gói chỉ có `output/`.
+Vì vậy, tạo gói theo contract L3B V2 bằng lệnh mặc định (không dùng
+`--output-only`):
 
 ```bash
-day09 package --output dist/submission.zip --output-only
+day09 package --output dist/submission.zip
 ```
 
-ZIP chỉ chứa các file kết quả dưới `output/`:
+ZIP gồm đúng manifest, trace và các output đã được validator kiểm tra:
 
 ```text
-output/<case_id>.json
+manifest.json
+trace.jsonl
+outputs/<case_id>.json
 ```
 
-Không đưa source, input, `.env`, API key, `metadata.json`, trace hoặc file audit vào
-ZIP. `metadata.json` ở repo khai báo model; `.env` giữ API key và đã được Git ignore.
-Commit và push source lên repo trước khi upload ZIP tại workspace `/l3b`.
-
-Lệnh không có `--output-only` vẫn tạo gói manifest/trace/outputs theo contract L3B V2.
+Không đưa source, input, `.env`, API key, `metadata.json` hoặc file audit ngoài
+contract vào ZIP. `metadata.json` ở repo khai báo model; `.env` giữ API key và đã
+được Git ignore. Commit và push source lên repo trước khi upload ZIP tại workspace
+`/l3b`. Gói legacy chỉ có `output/<case_id>.json` không qua được kiểm tra portal
+hiện tại vì thiếu manifest V2.
 
 ## Tiêu chí chấm điểm công khai
 
