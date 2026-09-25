@@ -209,6 +209,14 @@ async def solve_case(
     candidate_ids = [
         candidate for candidate in candidates[:20] if isinstance(candidate, str) and candidate
     ]
+    initial_candidates: list[str] = []
+    other_candidates: list[str] = []
+    if claimed_id and claimed_id in candidate_ids:
+        initial_candidates.append(str(claimed_id))
+        other_candidates = [c for c in candidate_ids if c != claimed_id]
+    else:
+        initial_candidates = list(candidate_ids)
+
     initial_calls = [
         (
             "policy-agent",
@@ -224,16 +232,18 @@ async def solve_case(
         )
     candidate_start = len(initial_calls)
     initial_calls.extend(
-        ("entity-agent", "get_order", {"order_id": candidate}) for candidate in candidate_ids
+        ("entity-agent", "get_order", {"order_id": candidate}) for candidate in initial_candidates
     )
     initial_results = await fetch_group(initial_calls)
     policy_evidence = initial_results[0]
+    if policy_evidence is None:
+        raise RuntimeError(f"Critical tool get_policy failed for {case_id}: MCP server unavailable")
     history_evidence = initial_results[history_index] if history_index is not None else None
     policy_data = policy_evidence.get("data", {}) if policy_evidence else {}
     rules = policy_data.get("rules", {}) if isinstance(policy_data, dict) else {}
 
     orders: dict[str, tuple[dict[str, Any], str]] = {}
-    for candidate, item in zip(candidate_ids, initial_results[candidate_start:], strict=True):
+    for candidate, item in zip(initial_candidates, initial_results[candidate_start:], strict=True):
         if item is None:
             continue
         order_records = _records(item.get("data"))
@@ -246,6 +256,36 @@ async def solve_case(
 
     history_records = _records(history_evidence.get("data")) if history_evidence else []
     history_order_ids = set(_ids(history_records, ("order_id",)))
+
+    claimed_record = orders.get(str(claimed_id), (None, ""))[0] if claimed_id else None
+    claimed_cust = _value(claimed_record, ("customer_unique_id",)) if claimed_record else None
+    claimed_mismatch = claimed_cust is not None and hint and str(claimed_cust) != str(hint)
+
+    claimed_resolved = (
+        claimed_record is not None
+        and not claimed_mismatch
+        and (
+            (hint is not None and claimed_cust is not None and str(claimed_cust) == str(hint))
+            or (claimed_id in history_order_ids)
+            or (claimed_cust is None and hint and claimed_id)
+        )
+    )
+
+    if other_candidates and not claimed_resolved:
+        other_calls = [
+            ("entity-agent", "get_order", {"order_id": candidate}) for candidate in other_candidates
+        ]
+        other_results = await fetch_group(other_calls)
+        for candidate, item in zip(other_candidates, other_results, strict=True):
+            if item is None:
+                continue
+            order_records = _records(item.get("data"))
+            record = next(
+                (value for value in order_records if str(_value(value, ("order_id",))) == candidate),
+                order_records[0] if len(order_records) == 1 else None,
+            )
+            if record is not None:
+                orders[candidate] = (record, _ref(item))
 
     hint_match: list[str] = []
     if hint:

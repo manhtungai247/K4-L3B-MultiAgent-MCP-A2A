@@ -201,6 +201,7 @@ async def _run(root: Path, *, resume: bool = False) -> None:
                 trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
                 completed_cases.add(case_id)
                 print(f"[{index}/{len(case_set.case_ids)}] completed {case_id}")
+                await asyncio.sleep(0.1)
     except ExceptionGroup as exc:
         if len(completed_cases) != len(case_set.case_ids):
             leaf: BaseException = exc
