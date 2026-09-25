@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import OUTPUT_SCHEMA_VERSION, VARIANT_ID
-from .cases import CaseSet
+from .cases import CaseSet, load_case_set
 from .contracts import Contracts
 
 SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
@@ -65,6 +65,7 @@ def validate_artifacts(
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
     seen_events: set[str] = set()
+    events_by_case: dict[str, list[dict[str, Any]]] = {case_id: [] for case_id in case_set.case_ids}
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
             continue
@@ -78,7 +79,49 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        events_by_case[event["case_id"]].append(event)
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    scoring = json.loads(
+        (root / "contracts" / "scoring" / "scoring-policy-v2.json").read_text(encoding="utf-8")
+    )
+    required_lifecycle = scoring["workflow_required_events"]
+    for case_id, output in outputs.items():
+        case_events = events_by_case[case_id]
+        event_types = [event["event_type"] for event in case_events]
+        missing_events = set(required_lifecycle) - set(event_types)
+        if missing_events:
+            raise ValueError(f"case {case_id} is missing workflow events: {sorted(missing_events)}")
+        positions = [event_types.index(event_type) for event_type in required_lifecycle]
+        if positions != sorted(positions):
+            raise ValueError(f"case {case_id} has an invalid workflow event order")
+
+        consumed_refs = {
+            evidence_ref
+            for event in case_events
+            if event["event_type"] == "tool_result_consumed"
+            for evidence_ref in event.get("evidence_refs", [])
+        }
+        output_refs = set(output.get("evidence_refs", []))
+        if not output_refs or not output_refs <= consumed_refs:
+            raise ValueError(f"case {case_id} has missing or untraced output evidence")
+
+        consumed_domains = {
+            (event.get("attributes") or {}).get("domain")
+            for event in case_events
+            if event["event_type"] == "tool_result_consumed"
+        }
+        scope = case_set.cases[case_id].get("investigation_scope", {})
+        required_domains = {"order", "item", "payment", "shipment", "policy", "refund"}
+        if scope.get("include_customer_history"):
+            required_domains.add("customer")
+        if scope.get("include_product_context"):
+            required_domains.add("product")
+        if not required_domains <= consumed_domains:
+            missing_domains = sorted(required_domains - consumed_domains)
+            raise ValueError(
+                f"case {case_id} is missing required evidence domains: {missing_domains}"
+            )
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
@@ -87,8 +130,6 @@ def validate_artifacts(
 
 
 def package_submission(root: Path, destination: Path) -> Path:
-    from .cases import load_case_set
-
     root = root.resolve()
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -112,6 +153,50 @@ def package_submission(root: Path, destination: Path) -> Path:
     if sum(map(len, payloads.values())) > MAX_SUBMISSION_BYTES:
         raise ValueError("submission exceeds the 12 MB uncompressed limit")
 
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in payloads.items():
+            archive.writestr(name, payload)
+    return destination
+
+
+def package_output_only(root: Path, destination: Path) -> Path:
+    """Build the coach-confirmed legacy upload: one output/ folder, nothing else."""
+    root = root.resolve()
+    case_set = load_case_set(root)
+    contracts = Contracts(root / "contracts" / "schemas")
+    validate_artifacts(root, case_set, contracts)
+    return _write_output_only_zip(root / "outputs", case_set.case_ids, destination, contracts)
+
+
+def _write_output_only_zip(
+    outputs_root: Path,
+    case_ids: tuple[str, ...],
+    destination: Path,
+    contracts: Contracts,
+) -> Path:
+    actual = {path.stem: path for path in outputs_root.glob("*.json") if path.is_file()}
+    expected = set(case_ids)
+    if set(actual) != expected:
+        missing = sorted(expected - set(actual))
+        extra = sorted(set(actual) - expected)
+        raise ValueError(f"outputs do not match case-set; missing={missing}, extra={extra}")
+    payloads: dict[str, bytes] = {}
+    for case_id in case_ids:
+        output = _json_object(actual[case_id])
+        contracts.validate_output(output, f"outputs/{case_id}.json")
+        if output.get("case_id") != case_id:
+            raise ValueError(f"outputs/{case_id}.json has a mismatched case_id")
+        payload = json.dumps(output, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(payload) > MAX_FILE_BYTES:
+            raise ValueError(f"outputs/{case_id}.json exceeds 1 MB")
+        if SECRET_PATTERN.search(payload.decode("utf-8")):
+            raise ValueError(f"outputs/{case_id}.json contains a Team API Key")
+        payloads[f"output/{case_id}.json"] = payload
+
+    if sum(map(len, payloads.values())) > MAX_SUBMISSION_BYTES:
+        raise ValueError("output-only submission exceeds the 12 MB uncompressed limit")
     destination = destination.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:

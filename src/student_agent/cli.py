@@ -10,7 +10,7 @@ from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
-from .submission import package_submission, validate_artifacts
+from .submission import package_output_only, package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
 
@@ -40,24 +40,63 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    required_tools = {
+        "get_order",
+        "get_order_items",
+        "get_order_payments",
+        "get_shipment_summary",
+        "get_policy",
+        "get_customer_history",
+        "get_product_context",
+        "get_payment_timeline",
+        "get_refund_timeline",
+    }
+    completed = 0
+    close_warning = False
+    try:
+        async with connect_gateway(
+            settings.mcp_endpoint, settings.team_api_key, contracts
+        ) as gateway:
+            discovered_tools = await gateway.list_tools()
+            missing_tools = required_tools - set(discovered_tools)
+            if missing_tools:
+                raise RuntimeError(
+                    f"MCP Gateway is missing required tools: {sorted(missing_tools)}"
+                )
+
+            for index, case_id in enumerate(case_set.case_ids, 1):
+                case = case_set.cases[case_id]
+                trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                output = await solve_case(case, gateway, trace)
+                if case_id in gateway.transport_errors:
+                    raise RuntimeError(f"MCP transport failed while investigating {case_id}")
+                contracts.validate_output(output, f"outputs/{case_id}.json")
+                if output.get("case_id") != case_id:
+                    raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                target = output_root / f"{case_id}.json"
+                temporary = target.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                temporary.replace(target)
+                trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                completed += 1
+                print(f"[{index}/{len(case_set.case_ids)}] completed {case_id}")
+    except ExceptionGroup as exc:
+        if completed != len(case_set.case_ids):
+            leaf: BaseException = exc
+            while isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
+                leaf = leaf.exceptions[0]
+            raise RuntimeError(
+                f"MCP stream failed after {completed}/{len(case_set.case_ids)} cases "
+                f"({type(leaf).__name__})"
+            ) from None
+        close_warning = True
+
+    if close_warning:
+        print("WARN: MCP stream closed with a warning after all outputs were saved")
+    _, trace_events = validate_artifacts(root, case_set, contracts)
+    print(f"OK: validated {len(case_set.case_ids)} outputs / {len(trace_events)} trace events")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -70,6 +109,11 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
+    package.add_argument(
+        "--output-only",
+        action="store_true",
+        help="build the Lab Coach confirmed ZIP containing only output/<case_id>.json",
+    )
     return result
 
 
@@ -80,8 +124,7 @@ def main() -> None:
         if args.command == "validate-inputs":
             case_set = load_case_set(root)
             print(
-                f"OK: {case_set.variant_id} / {case_set.version} / "
-                f"{len(case_set.case_ids)} cases"
+                f"OK: {case_set.variant_id} / {case_set.version} / {len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
@@ -93,11 +136,18 @@ def main() -> None:
             _, trace = validate_artifacts(root, case_set, contracts)
             print(f"OK: {len(case_set.case_ids)} outputs / {len(trace)} trace events")
         elif args.command == "package":
-            destination = package_submission(root, root / args.output)
+            builder = package_output_only if args.output_only else package_submission
+            destination = builder(root, root / args.output)
             print(f"OK: {destination}")
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    except ExceptionGroup as exc:
+        leaf: BaseException = exc
+        while isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
+            leaf = leaf.exceptions[0]
+        print(f"ERROR: MCP session failed ({type(leaf).__name__})", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

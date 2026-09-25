@@ -1,0 +1,7 @@
+{
+  "schema_version": "day09-model-metadata-v1",
+  "model_name": "none - deterministic Python rule engine",
+  "model_parameters": 0,
+  "runtime": "python",
+  "uses_external_llm": false
+}

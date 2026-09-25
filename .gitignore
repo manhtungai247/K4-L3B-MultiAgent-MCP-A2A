@@ -22,6 +22,8 @@ inputs/*
 !inputs/.gitkeep
 outputs/*
 !outputs/.gitkeep
+output/*
+!output/.gitkeep
 traces/*
 !traces/.gitkeep
 dist/*

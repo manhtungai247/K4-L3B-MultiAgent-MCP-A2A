@@ -162,19 +162,23 @@ Nếu output pass schema nhưng điểm thấp, cần kiểm tra semantic, entit
 
 ## 7. Đóng gói và nộp bài
 
+Với luồng upload `output/` mà Lab Coach xác nhận cho bài này, chạy:
+
 ```bash
-day09 package --output dist/submission.zip
+day09 package --output dist/submission.zip --output-only
 ```
 
-ZIP chỉ được chứa:
+ZIP chỉ chứa các file kết quả dưới `output/`:
 
 ```text
-manifest.json
-trace.jsonl
-outputs/<case_id>.json
+output/<case_id>.json
 ```
 
-Không đưa source, input, `.env`, API key hoặc debug log vào ZIP. Sau đó upload `dist/submission.zip` tại workspace `/l3b` và chọn submission muốn dùng làm final.
+Không đưa source, input, `.env`, API key, `metadata.json`, trace hoặc file audit vào
+ZIP. `metadata.json` ở repo khai báo model; `.env` giữ API key và đã được Git ignore.
+Commit và push source lên repo trước khi upload ZIP tại workspace `/l3b`.
+
+Lệnh không có `--output-only` vẫn tạo gói manifest/trace/outputs theo contract L3B V2.
 
 ## Tiêu chí chấm điểm công khai
 
