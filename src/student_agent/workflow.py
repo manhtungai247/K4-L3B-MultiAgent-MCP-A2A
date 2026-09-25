@@ -54,6 +54,13 @@ def _value(record: Any, names: tuple[str, ...]) -> Any:
     return None
 
 
+def _timeline_events(value: Any) -> list[dict[str, Any]]:
+    """Read the event ledger, not the payment summary beside it."""
+    if isinstance(value, dict) and "events" in value:
+        return _records(value["events"])
+    return _records(value)
+
+
 def _all_values(record: Any, names: tuple[str, ...]) -> list[Any]:
     values: list[Any] = []
     if isinstance(record, dict):
@@ -385,8 +392,8 @@ async def solve_case(
     item_records = _records(item_evidence.get("data")) if item_evidence else []
     payment_records = _records(payment_evidence.get("data")) if payment_evidence else []
     shipment_records = _records(shipment_evidence.get("data")) if shipment_evidence else []
-    payment_events = _records(payment_timeline.get("data")) if payment_timeline else []
-    refund_events = _records(refund_timeline.get("data")) if refund_timeline else []
+    payment_events = _timeline_events(payment_timeline.get("data")) if payment_timeline else []
+    refund_events = _timeline_events(refund_timeline.get("data")) if refund_timeline else []
     shipment_data = shipment_evidence.get("data") if shipment_evidence else {}
     data_conflicts: list[dict[str, Any]] = []
 
@@ -493,12 +500,20 @@ async def solve_case(
     shipment_shipped_at = _time(
         _value(
             shipment_data,
-            ("seller_handoff_at", "carrier_handoff_at", "order_delivered_carrier_date"),
+            (
+                "seller_handoff_at",
+                "carrier_handoff_at",
+                "delivered_carrier_at",
+                "order_delivered_carrier_date",
+            ),
         )
     )
     order_delivered_at = _time(_value(order, ("order_delivered_customer_date", "delivered_at")))
     shipment_delivered_at = _time(
-        _value(shipment_data, ("delivered_at", "order_delivered_customer_date"))
+        _value(
+            shipment_data,
+            ("delivered_at", "delivered_customer_at", "order_delivered_customer_date"),
+        )
     )
     order_estimated_at = _time(
         _value(order, ("order_estimated_delivery_date", "estimated_delivery_at"))

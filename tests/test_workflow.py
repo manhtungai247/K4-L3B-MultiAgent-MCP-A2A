@@ -304,3 +304,13 @@ def test_independent_mcp_lookups_run_with_a_bounded_concurrency(tmp_path: Path) 
 
     contracts.validate_output(output, "concurrent lookup output")
     assert gateway.peak == 4
+
+
+def test_timeline_prefers_event_ledger_over_payment_summary() -> None:
+    from student_agent.workflow import _timeline_events
+
+    capture = {"event_type": "captured", "amount_brl": "89.00"}
+    payload = {"payments": [{"payment_value": "16.00"}], "events": [capture]}
+    assert _timeline_events(payload) == [capture]
+    assert _timeline_events({"payments": [{"payment_value": "16.00"}], "events": []}) == []
+    assert _timeline_events([capture]) == [capture]
