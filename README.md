@@ -151,6 +151,9 @@ day09 run
 day09 validate
 ```
 
+Nếu MCP bị ngắt giữa batch, tiếp tục bằng `day09 run --resume`; lệnh chỉ bỏ qua
+case đã có output và trace hợp lệ, không gọi lại các case đó.
+
 Kết quả được tạo tại:
 
 ```text

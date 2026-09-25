@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from .cases import load_case_set
+from .cases import CaseSet, load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
@@ -27,7 +27,68 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+def _prepare_resume(root: Path, case_set: CaseSet, contracts: Contracts) -> set[str]:
+    trace_path = root / "traces" / "trace.jsonl"
+    expected = set(case_set.case_ids)
+    events_by_case: dict[str, list[tuple[dict, str]]] = {case_id: [] for case_id in expected}
+    if trace_path.exists():
+        for number, line in enumerate(trace_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"traces/trace.jsonl:{number}: invalid JSON") from exc
+            contracts.validate_trace(event, f"traces/trace.jsonl:{number}")
+            if event["case_id"] not in expected:
+                raise ValueError(f"traces/trace.jsonl:{number}: case is outside this case-set")
+            events_by_case[event["case_id"]].append((event, line))
+
+    completed: set[str] = set()
+    for case_id in case_set.case_ids:
+        output_path = root / "outputs" / f"{case_id}.json"
+        events = events_by_case[case_id]
+        if not output_path.is_file() or not any(
+            event["event_type"] == "case_finalized" for event, _ in events
+        ):
+            continue
+        try:
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        try:
+            contracts.validate_output(output, f"outputs/{case_id}.json")
+        except ValueError:
+            continue
+        if output.get("case_id") == case_id:
+            completed.add(case_id)
+
+    for path in (root / "outputs").glob("*.json"):
+        if path.stem not in completed:
+            path.unlink()
+    kept_lines = [
+        line
+        for case_id in case_set.case_ids
+        if case_id in completed
+        for event, line in events_by_case[case_id]
+    ]
+    temporary_trace = trace_path.with_suffix(".jsonl.tmp")
+    temporary_trace.write_text(
+        "\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8"
+    )
+    temporary_trace.replace(trace_path)
+
+    subset = CaseSet(
+        case_set.version,
+        case_set.variant_id,
+        tuple(case_id for case_id in case_set.case_ids if case_id in completed),
+        {case_id: case_set.cases[case_id] for case_id in completed},
+    )
+    validate_artifacts(root, subset, contracts)
+    return completed
+
+
+async def _run(root: Path, *, resume: bool = False) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -35,9 +96,11 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
+    completed_cases = _prepare_resume(root, case_set, contracts) if resume else set()
+    if not resume:
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
     required_tools = {
@@ -51,7 +114,14 @@ async def _run(root: Path) -> None:
         "get_payment_timeline",
         "get_refund_timeline",
     }
-    completed = 0
+    if len(completed_cases) == len(case_set.case_ids):
+        _, trace_events = validate_artifacts(root, case_set, contracts)
+        print(
+            f"OK: already complete: {len(completed_cases)} outputs / "
+            f"{len(trace_events)} trace events"
+        )
+        return
+
     close_warning = False
     try:
         async with connect_gateway(
@@ -65,6 +135,8 @@ async def _run(root: Path) -> None:
                 )
 
             for index, case_id in enumerate(case_set.case_ids, 1):
+                if case_id in completed_cases:
+                    continue
                 case = case_set.cases[case_id]
                 trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
                 output = await solve_case(case, gateway, trace)
@@ -80,15 +152,15 @@ async def _run(root: Path) -> None:
                 )
                 temporary.replace(target)
                 trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
-                completed += 1
+                completed_cases.add(case_id)
                 print(f"[{index}/{len(case_set.case_ids)}] completed {case_id}")
     except ExceptionGroup as exc:
-        if completed != len(case_set.case_ids):
+        if len(completed_cases) != len(case_set.case_ids):
             leaf: BaseException = exc
             while isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
                 leaf = leaf.exceptions[0]
             raise RuntimeError(
-                f"MCP stream failed after {completed}/{len(case_set.case_ids)} cases "
+                f"MCP stream failed after {len(completed_cases)}/{len(case_set.case_ids)} cases "
                 f"({type(leaf).__name__})"
             ) from None
         close_warning = True
@@ -105,7 +177,12 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="keep validated outputs and trace events, then continue unfinished cases",
+    )
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -129,7 +206,7 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, resume=args.resume))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")

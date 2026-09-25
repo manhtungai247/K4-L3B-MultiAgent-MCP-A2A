@@ -75,13 +75,15 @@ chosen source and resolution code appear in `data_conflicts`.
 | Failure | Retry budget | Fallback | Trace / package behavior |
 | --- | ---: | --- | --- |
 | Candidate order lookup returns a tool error | 0 | Continue with other candidates; do not fabricate evidence | Record other successful results; unresolved entity stays unresolved |
-| MCP transport failure | 0 | Stop fetching for that case | Emit `evidence_unavailable`; runner stops rather than submit partial results |
+| MCP transport failure | 0 | Stop fetching for that case; resume skips only cases with valid output and final trace | Emit `evidence_unavailable`; runner stops rather than submit partial results |
 | Candidate identity is missing or conflicting | 0 | Use exact claimed ID only when the source has no explicit mismatch | `not_found` / `ambiguous`; package checks required evidence |
 | Shipment or payment sources disagree | 0 | Use the timeline source described above | Add a `data_conflicts` entry |
 | Required evidence domain is absent | 0 | No synthetic or cached cross-case substitute | Local artifact validation rejects packaging |
 
 The runner discovers tools once and keeps one authenticated session for the
-batch to avoid reconnect overhead. Each L3B case uses at most ten calls: policy,
+batch to avoid reconnect overhead. On interruption, `day09 run --resume` keeps
+only cases whose output and lifecycle/evidence trace validate, drops unfinished
+case artifacts, and continues with the rest. Each L3B case uses at most ten calls: policy,
 customer history, two candidate
 orders, and six scoped order/product/shipment/payment/refund lookups. There are
 no automatic retries. The gateway cache prevents duplicate identical calls
