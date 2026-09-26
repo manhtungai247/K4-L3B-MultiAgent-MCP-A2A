@@ -288,7 +288,11 @@ async def solve_case(
                 continue
             order_records = _records(item.get("data"))
             record = next(
-                (value for value in order_records if str(_value(value, ("order_id",))) == candidate),
+                (
+                    value
+                    for value in order_records
+                    if str(_value(value, ("order_id",))) == candidate
+                ),
                 order_records[0] if len(order_records) == 1 else None,
             )
             if record is not None:
