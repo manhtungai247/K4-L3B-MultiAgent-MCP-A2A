@@ -87,7 +87,7 @@ only cases whose output and lifecycle/evidence trace validate, drops unfinished
 case artifacts, and continues with the rest. Each L3B case uses at most ten calls: policy,
 customer history, two candidate
 orders, and six scoped order/product/shipment/payment/refund lookups. There are
-There are no workflow-level retries; the HTTP transport retries connection
+no workflow-level retries; the HTTP transport retries connection
 failures up to five times. Independent calls run in groups capped at four
 concurrent requests. The gateway cache prevents duplicate identical calls
 within one case; all calls remain auditable by the competition service.

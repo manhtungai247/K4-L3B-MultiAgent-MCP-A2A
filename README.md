@@ -25,11 +25,28 @@ python -m pip install -e ".[dev]"
 cp .env.example .env
 ```
 
+Trên Windows PowerShell:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+Copy-Item .env.example .env
+```
+
 Kiểm tra:
 
 ```bash
 pytest -q
+ruff check src tests
 day09 --help
+```
+
+Kiểm tra trên Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check src tests
+.\.venv\Scripts\day09.exe --help
 ```
 
 ## 2. Đăng ký team
@@ -49,11 +66,19 @@ MCP_ENDPOINT=http://127.0.0.1:8001/mcp
 
 ## 3. Tải input
 
-Tải ZIP input **L3B** từ GitHub Release và giải nén vào root repo:
+Tải ZIP input **L3B** từ Competition Workspace hoặc nguồn do giảng viên cung cấp,
+sau đó giải nén vào root repo:
 
 ```bash
 unzip l3b-inputs-<version>.zip -d .
 day09 validate-inputs
+```
+
+Trên Windows PowerShell:
+
+```powershell
+Expand-Archive l3b-inputs-<version>.zip -DestinationPath .
+.\.venv\Scripts\day09.exe validate-inputs
 ```
 
 Cấu trúc đúng:
